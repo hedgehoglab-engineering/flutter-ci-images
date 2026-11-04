@@ -1,0 +1,5 @@
+.DS_Store
+smoke/.dart_tool/
+smoke/pubspec.lock
+smoke/test/goldens/
+*.log

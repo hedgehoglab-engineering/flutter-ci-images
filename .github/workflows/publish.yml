@@ -1,0 +1,174 @@
+name: Publish Flutter image
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: Stable Flutter version to publish (for example 3.47.9)
+        type: string
+        required: true
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/hedgehoglab-engineering/flutter
+  OWNER: hedgehoglab-engineering
+  PACKAGE: flutter
+  MIN_VERSION: 3.47.8
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+      has_work: ${{ steps.filter.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve candidate versions
+        id: candidates
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.flutter_version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            versions="$(scripts/resolve-versions.sh --version "$INPUT_VERSION")"
+          else
+            versions="$(scripts/resolve-versions.sh --min "$MIN_VERSION")"
+          fi
+          echo "Candidates: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+      - name: Drop versions that already have a tag
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATES: ${{ steps.candidates.outputs.versions }}
+        run: |
+          matrix='[]'
+          while IFS= read -r entry; do
+            version="$(jq -r .version <<<"$entry")"
+            exists="$(scripts/tag-exists.sh "$version")"
+            if [ "$exists" = "true" ]; then
+              echo "Skip $version, tag exists (tags are immutable)"
+            else
+              matrix="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$matrix")"
+            fi
+          done < <(jq -c '.[]' <<<"$CANDIDATES")
+
+          if [ "$(jq 'length' <<<"$matrix")" -gt 0 ]; then
+            has_work=true
+          else
+            has_work=false
+          fi
+          echo "Matrix: $matrix"
+          {
+            echo "matrix=$matrix"
+            echo "has_work=$has_work"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.has_work == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-flutter-${{ matrix.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.2
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check tag before build
+        id: precheck
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          exists="$(scripts/tag-exists.sh "$VERSION")"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = "true" ]; then
+            echo "Skip $VERSION, tag exists (tags are immutable)"
+          fi
+
+      - name: Compute build timestamp
+        id: meta
+        if: steps.precheck.outputs.exists == 'false'
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        if: steps.precheck.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ matrix.version }}
+          build-args: |
+            FLUTTER_VERSION=${{ matrix.version }}
+            FLUTTER_REVISION=${{ matrix.revision }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Smoke test image
+        if: steps.precheck.outputs.exists == 'false'
+        env:
+          VERSION: ${{ matrix.version }}
+        run: scripts/smoke-test.sh "$IMAGE:$VERSION"
+
+      - name: Check tag before push
+        id: prepush
+        if: steps.precheck.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          exists="$(scripts/tag-exists.sh "$VERSION")"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = "true" ]; then
+            echo "::error::Tag $VERSION appeared during the build; refusing to overwrite"
+            exit 1
+          fi
+
+      - name: Push image
+        if: steps.prepush.outputs.exists == 'false'
+        env:
+          VERSION: ${{ matrix.version }}
+        run: |
+          docker push "$IMAGE:$VERSION"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")"
+          {
+            echo "### Flutter $VERSION"
+            echo
+            echo "- Image: \`$IMAGE:$VERSION\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
