@@ -9,21 +9,32 @@ image="$1"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# The root run leaves root-owned files in the bind mount; on a Linux host only
+# root can delete them, so clean up from inside the image first.
+cleanup() {
+  docker run --rm --platform linux/amd64 --network none -v "$work:/w" "$image" \
+    bash -c 'rm -rf /w/root /w/user' >/dev/null 2>&1 || true
+  rm -rf "$work" 2>/dev/null || true
+}
+trap cleanup EXIT
 
-# run_smoke <script> [extra docker args...]
+# prepare <dir>: fresh copy of the smoke package without generated files.
+prepare() {
+  cp -R "$repo_root/smoke" "$work/$1"
+  rm -rf "$work/$1/.dart_tool" "$work/$1/pubspec.lock" "$work/$1/test/goldens"
+}
+
+# run_smoke <dir> <script> [extra docker args...]
 run_smoke() {
-  local script="$1"
-  shift
+  local dir="$1" script="$2"
+  shift 2
   docker run --rm --platform linux/amd64 --network none \
-    "$@" -v "$work/smoke:/workspace" "$image" bash -euxo pipefail -c "$script"
+    "$@" -v "$work/$dir:/workspace" "$image" bash -euxo pipefail -c "$script"
 }
 
 echo "== Run 1: root user"
-rm -rf "$work/smoke"
-cp -R "$repo_root/smoke" "$work/smoke"
-rm -rf "$work/smoke/.dart_tool" "$work/smoke/pubspec.lock" "$work/smoke/test/goldens"
-run_smoke '
+prepare root
+run_smoke root '
   flutter --version
   flutter doctor -v || true
   flutter pub get --offline
@@ -32,11 +43,9 @@ run_smoke '
 '
 
 echo "== Run 2: non-root user 1001:1001"
-rm -rf "$work/smoke"
-cp -R "$repo_root/smoke" "$work/smoke"
-rm -rf "$work/smoke/.dart_tool" "$work/smoke/pubspec.lock" "$work/smoke/test/goldens"
-chmod -R a+rwX "$work/smoke"
-run_smoke '
+prepare user
+chmod -R a+rwX "$work/user"
+run_smoke user '
   flutter --version
   flutter pub get --offline
   flutter test --update-goldens
